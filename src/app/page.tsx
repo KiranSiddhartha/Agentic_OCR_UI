@@ -169,39 +169,21 @@ export default function Home() {
   }
 
   const handleUpload = async (files: FileList) => {
-    // const apiBases = Array.from(
-    //   new Set(
-    //     [
-    //       process.env.NEXT_PUBLIC_API_BASE,
-    //       "http://127.0.0.1:8000",
-    //       "http://localhost:8000",
-    //     ].filter((v): v is string => Boolean(v))
-    //   )
-    // )
-
-    const apiBases = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000"
-
-    // const apiFetch = async (path: string, init: RequestInit) => {
-    //   let lastErr: unknown = null
-    //   for (const base of apiBases) {
-    //     try {
-    //       return await fetch(`${base}${path}`, init)
-    //     } catch (err) {
-    //       lastErr = err
-    //     }
-    //   }
-    //   throw lastErr || new Error(`Unable to reach backend for ${path}`)
-    // }
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000"
 
     const apiFetch = async (path: string, init: RequestInit) => {
-      const res = await fetch(`${apiBases}${path}`, init)
+      try {
+        const res = await fetch(`${API_BASE}${path}`, init)
 
-      if (!res.ok) {
-        const text = await res.text()
-        throw new Error(text || `API request failed: ${res.status}`)
+        if (!res.ok) {
+          const text = await res.text()
+          throw new Error(text || `API request failed: ${res.status}`)
+        }
+
+        return res
+      } catch (err) {
+        throw new Error("Backend service is not reachable")
       }
-
-      return res
     }
 
     let filesArray = Array.from(files)
