@@ -37,7 +37,8 @@ export default function DocumentPreview({
     }
     selectedPage = Math.max(0, Math.min(selectedPage, imageUrls.length - 1))
   }
-  const currentPage = Math.max(0, Math.min(pageCursor, Math.max(0, imageUrls.length - 1)))
+  const basePage = selectedPage ?? pageCursor
+  const currentPage = Math.max(0, Math.min(basePage, Math.max(0, imageUrls.length - 1)))
   const currentUrl = imageUrls[currentPage]
   const currentMediaType = mediaTypes?.[currentPage]?.toLowerCase() || ""
   const isPdf =
@@ -45,19 +46,6 @@ export default function DocumentPreview({
   const showImage = Boolean(currentUrl) && !isPdf
   const imageFailed = failedUrl === currentUrl
   const imageReady = loadedUrl === currentUrl && showImage && !imageFailed
-
-  useEffect(() => {
-    if (selectedPage === null) return
-    setPageCursor(selectedPage)
-  }, [selectedPage])
-
-  useEffect(() => {
-    if (imageUrls.length === 0) {
-      setPageCursor(0)
-      return
-    }
-    setPageCursor((p) => Math.max(0, Math.min(p, imageUrls.length - 1)))
-  }, [imageUrls.length])
 
   useEffect(() => {
     if (!selectedField?.bbox || !imageReady) {

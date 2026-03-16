@@ -1,15 +1,15 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
+import dynamic from "next/dynamic"
 import DocumentPreview from "@/components/DocumentPreview"
 import FieldsPanel from "@/components/FieldsPanel"
 import SummaryPanel from "@/components/SummaryPanel"
 import Tabs from "@/components/Tabs"
-import { Pie } from "react-chartjs-2"
-import { ArcElement, Chart as ChartJS, Legend, Tooltip } from "chart.js"
+import "chart.js/auto"
 import type { Field as FieldType } from "@/components/FieldsPanel"
 
-ChartJS.register(ArcElement, Tooltip, Legend)
+const Pie = dynamic(() => import("react-chartjs-2").then((m) => m.Pie), { ssr: false })
 const SHOW_FILENAMES_IN_PREVIEW = true
 const PREVIEW_WIDTH_PERCENT = 45 // change to 40 for 40/60 layout
 const OUTPUT_WIDTH_PERCENT = 100 - PREVIEW_WIDTH_PERCENT
@@ -54,6 +54,89 @@ interface ExpandedZipFile {
 interface ExpandZipResponse {
   file_count: number
   files: ExpandedZipFile[]
+}
+
+const ensureArrayOfStrings = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : []
+
+const ensureRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" ? (value as Record<string, unknown>) : {}
+
+const normalizeAnalyzeResponse = (value: unknown): AnalyzeResponse => {
+  const fallback: AnalyzeResponse = {
+    document_type: "OTH",
+    policy_type: "OTH",
+    document_type_explanation: "Unknown document type",
+    policy_type_explanation: "Unknown policy type",
+    confidence: 0,
+    page_count: 0,
+    fields: {},
+    pages: [],
+    processing_time: 0,
+    raw_lines: [],
+    raw_lines_by_page: [],
+    expected_fields: [],
+    summary_counts: { perfect: 0, partial: 0, failed: 0 },
+  }
+
+  const root = ensureRecord(value)
+  const nested =
+    ensureRecord(root.result).document_type !== undefined
+      ? ensureRecord(root.result)
+      : ensureRecord(root.data).document_type !== undefined
+      ? ensureRecord(root.data)
+      : root
+
+  const fieldsRaw =
+    ensureRecord(nested.fields).constructor === Object
+      ? nested.fields
+      : ensureRecord(nested.extracted_fields).constructor === Object
+      ? nested.extracted_fields
+      : ensureRecord(nested.form_fields)
+  const fields = ensureRecord(fieldsRaw) as Record<string, FieldType>
+
+  const pages = ensureArrayOfStrings(nested.pages ?? nested.page_images ?? nested.preview_pages)
+  const rawLines = ensureArrayOfStrings(nested.raw_lines ?? nested.ocr_lines)
+  const rawLinesByPageRaw = Array.isArray(nested.raw_lines_by_page)
+    ? nested.raw_lines_by_page
+    : Array.isArray(nested.ocr_lines_by_page)
+    ? nested.ocr_lines_by_page
+    : []
+  const rawLinesByPage = rawLinesByPageRaw
+    .map((page) => ensureArrayOfStrings(page))
+    .filter((page) => page.length > 0)
+
+  const summaryRaw = ensureRecord(nested.summary_counts)
+  const summary = {
+    perfect: Number(summaryRaw.perfect ?? 0) || 0,
+    partial: Number(summaryRaw.partial ?? 0) || 0,
+    failed: Number(summaryRaw.failed ?? 0) || 0,
+  }
+
+  const expectedFields = ensureArrayOfStrings(nested.expected_fields)
+  return {
+    document_type: String(nested.document_type ?? nested.doc_type ?? fallback.document_type),
+    policy_type: String(nested.policy_type ?? fallback.policy_type),
+    document_type_explanation:
+      typeof nested.document_type_explanation === "string"
+        ? nested.document_type_explanation
+        : fallback.document_type_explanation,
+    policy_type_explanation:
+      typeof nested.policy_type_explanation === "string"
+        ? nested.policy_type_explanation
+        : fallback.policy_type_explanation,
+    confidence: Number(nested.confidence ?? 0) || 0,
+    page_count:
+      Number(nested.page_count ?? 0) ||
+      Math.max(0, pages.length, rawLinesByPage.length > 0 ? rawLinesByPage.length : 0),
+    fields,
+    pages,
+    processing_time: Number(nested.processing_time ?? nested.processing_time_sec ?? 0) || 0,
+    raw_lines: rawLines,
+    raw_lines_by_page: rawLinesByPage,
+    expected_fields: expectedFields.length > 0 ? expectedFields : Object.keys(fields),
+    summary_counts: summary,
+  }
 }
 
 const getSummaryBreakdown = (result: AnalyzeResponse) => {
@@ -131,10 +214,13 @@ const base64ToUint8Array = (base64: string) => {
   return bytes
 }
 
+const errorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
 export default function Home() {
   const [results, setResults] = useState<AnalyzeResponse[]>([])
   const [previewUrlsByFile, setPreviewUrlsByFile] = useState<string[][]>([])
   const [previewMediaTypesByFile, setPreviewMediaTypesByFile] = useState<string[][]>([])
+  const [previewLoadingByFile, setPreviewLoadingByFile] = useState<boolean[]>([])
   const [selectedByDoc, setSelectedByDoc] = useState<Record<number, string | null>>({})
   const [uploadedFileNames, setUploadedFileNames] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
@@ -143,6 +229,27 @@ export default function Home() {
   const [showBackToTop, setShowBackToTop] = useState(false)
   const abortControllerRef = useRef<AbortController | null>(null)
   const runIdRef = useRef(0)
+  const logPipeline = (
+    level: "info" | "warn" | "error",
+    event: string,
+    details: Record<string, unknown> = {}
+  ) => {
+    const payload = {
+      ts: new Date().toISOString(),
+      runId: runIdRef.current,
+      event,
+      ...details,
+    }
+    if (level === "error") {
+      console.error("[upload-pipeline]", payload)
+      return
+    }
+    if (level === "warn") {
+      console.warn("[upload-pipeline]", payload)
+      return
+    }
+    console.log("[upload-pipeline]", payload)
+  }
 
   useEffect(() => {
     const onScroll = () => {
@@ -155,13 +262,16 @@ export default function Home() {
 
   const handleBack = () => {
     runIdRef.current += 1
+    logPipeline("warn", "user_reset")
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
       abortControllerRef.current = null
+      logPipeline("warn", "active_run_aborted")
     }
     setResults([])
     setPreviewUrlsByFile([])
     setPreviewMediaTypesByFile([])
+    setPreviewLoadingByFile([])
     setSelectedByDoc({})
     setUploadedFileNames([])
     setLoading(false)
@@ -169,20 +279,38 @@ export default function Home() {
   }
 
   const handleUpload = async (files: FileList) => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000"
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api"
+    logPipeline("info", "upload_selected", {
+      selectedCount: files.length,
+      selectedFiles: Array.from(files).map((f) => f.name),
+    })
 
     const apiFetch = async (path: string, init: RequestInit) => {
+      const startedAt = Date.now()
       try {
         const res = await fetch(`${API_BASE}${path}`, init)
+        const durationMs = Date.now() - startedAt
 
         if (!res.ok) {
           const text = await res.text()
+          logPipeline("error", "api_failed", {
+            path,
+            status: res.status,
+            durationMs,
+            responseSnippet: text?.slice(0, 400) || "",
+          })
           throw new Error(text || `API request failed: ${res.status}`)
         }
 
+        logPipeline("info", "api_ok", { path, status: res.status, durationMs })
         return res
       } catch (err) {
-        throw new Error("Backend service is not reachable")
+        logPipeline("error", "api_unreachable", {
+          path,
+          durationMs: Date.now() - startedAt,
+          error: errorMessage(err),
+        })
+        throw new Error(`Request to ${path} failed: ${errorMessage(err)}`)
       }
     }
 
@@ -205,6 +333,7 @@ export default function Home() {
         continue
       }
       try {
+        logPipeline("info", "zip_expand_start", { zipFile: f.name, sizeBytes: f.size })
         const zipData = new FormData()
         zipData.append("file", f)
         const zipRes = await apiFetch("/expand-zip", {
@@ -214,19 +343,29 @@ export default function Home() {
         const zipJson: ExpandZipResponse | { error?: string } = await zipRes.json()
         if (!zipRes.ok || !("files" in zipJson)) {
           console.error("ZIP expansion failed:", (zipJson as { error?: string }).error || "unknown error")
+          logPipeline("error", "zip_expand_failed", {
+            zipFile: f.name,
+            error: (zipJson as { error?: string }).error || "unknown error",
+          })
           continue
         }
+        logPipeline("info", "zip_expand_ok", {
+          zipFile: f.name,
+          expandedCount: zipJson.files.length,
+        })
         for (const entry of zipJson.files) {
           const bytes = base64ToUint8Array(entry.data_base64)
           expandedQueue.push(new File([bytes], entry.name, { type: entry.type || "application/octet-stream" }))
         }
       } catch (err) {
         console.error("ZIP expansion failed:", err)
+        logPipeline("error", "zip_expand_exception", { zipFile: f.name, error: errorMessage(err) })
       }
     }
 
     filesArray = expandedQueue
     if (filesArray.length === 0) {
+      logPipeline("warn", "no_files_after_expansion")
       setLoading(false)
       return
     }
@@ -235,16 +374,23 @@ export default function Home() {
     const runId = runIdRef.current
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
+      logPipeline("warn", "previous_run_aborted", { newRunId: runId })
     }
     const controller = new AbortController()
     abortControllerRef.current = controller
     const { signal } = controller
 
     setUploadedFileNames(filesArray.map((f) => f.name))
+    logPipeline("info", "processing_started", {
+      runId,
+      totalFiles: filesArray.length,
+      files: filesArray.map((f) => f.name),
+    })
 
     // Show instant preview per file while OCR runs.
     const initialPreviews: string[][] = Array.from({ length: filesArray.length }, () => [])
     const initialMediaTypes: string[][] = Array.from({ length: filesArray.length }, () => [])
+    const initialPreviewLoading: boolean[] = Array.from({ length: filesArray.length }, () => false)
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i]
       const fileType = (file.type || "").toLowerCase()
@@ -252,10 +398,13 @@ export default function Home() {
       if (!isPdf) {
         initialPreviews[i] = [URL.createObjectURL(file)]
         initialMediaTypes[i] = [fileType || "image/*"]
+      } else {
+        initialPreviewLoading[i] = true
       }
     }
     setPreviewUrlsByFile(initialPreviews)
     setPreviewMediaTypesByFile(initialMediaTypes)
+    setPreviewLoadingByFile(initialPreviewLoading)
 
     const fallbackResult = (): AnalyzeResponse => ({
       document_type: "OTH",
@@ -273,39 +422,66 @@ export default function Home() {
       summary_counts: { perfect: 0, partial: 0, failed: 0 },
     })
 
-    // Process one file at a time: preview -> analyze -> next file.
-    for (let i = 0; i < filesArray.length; i++) {
-      if (runIdRef.current !== runId || signal.aborted) break
-      const file = filesArray[i]
+    const startPreviewInBackground = async (file: File, index: number) => {
+      const previewData = new FormData()
+      previewData.append("file", file)
+      logPipeline("info", "preview_start", { runId, index, fileName: file.name })
       try {
-        const previewData = new FormData()
-        previewData.append("file", file)
-
         const previewRes = await apiFetch("/preview", {
           method: "POST",
           body: previewData,
           signal,
         })
-        if (runIdRef.current !== runId || signal.aborted) break
+        if (runIdRef.current !== runId || signal.aborted) return
         const previewJson: PreviewResponse = await previewRes.json()
         if (previewRes.ok && previewJson.pages?.length > 0) {
+          logPipeline("info", "preview_ok", {
+            runId,
+            index,
+            fileName: file.name,
+            pages: previewJson.pages.length,
+          })
           setPreviewUrlsByFile((prev) => {
             if (runIdRef.current !== runId || signal.aborted) return prev
             const next = [...prev]
-            next[i] = previewJson.pages
+            next[index] = previewJson.pages
             return next
           })
           setPreviewMediaTypesByFile((prev) => {
             if (runIdRef.current !== runId || signal.aborted) return prev
             const next = [...prev]
-            next[i] = new Array(previewJson.pages.length).fill("image/png")
+            next[index] = new Array(previewJson.pages.length).fill("image/png")
             return next
           })
         }
       } catch (err) {
-        if (signal.aborted) break
-        console.error("Preview generation failed:", err)
+        if (!signal.aborted) {
+          console.error("Preview generation failed:", err)
+          logPipeline("error", "preview_failed", {
+            runId,
+            index,
+            fileName: file.name,
+            error: errorMessage(err),
+          })
+        }
+      } finally {
+        if (runIdRef.current !== runId || signal.aborted) return
+        logPipeline("info", "preview_done", { runId, index, fileName: file.name })
+        setPreviewLoadingByFile((prev) => {
+          const next = [...prev]
+          next[index] = false
+          return next
+        })
       }
+    }
+
+    const previewTasks: Array<Promise<void>> = []
+
+    // Process one file at a time: analyze -> next file.
+    for (let i = 0; i < filesArray.length; i++) {
+      if (runIdRef.current !== runId || signal.aborted) break
+      const file = filesArray[i]
+      logPipeline("info", "analyze_start", { runId, index: i, fileName: file.name })
 
       const formData = new FormData()
       formData.append("file", file)
@@ -320,7 +496,15 @@ export default function Home() {
           const errText = await res.text().catch(() => "")
           throw new Error(errText || `Analyze failed with status ${res.status}`)
         }
-        const data: AnalyzeResponse = await res.json()
+        const rawData = await res.json()
+        const data = normalizeAnalyzeResponse(rawData)
+        logPipeline("info", "analyze_ok", {
+          runId,
+          index: i,
+          fileName: file.name,
+          pageCount: data.page_count,
+          processingTimeSec: data.processing_time,
+        })
         setResults((prev) => {
           if (runIdRef.current !== runId || signal.aborted) return prev
           const next = [...prev]
@@ -330,6 +514,12 @@ export default function Home() {
       } catch (err) {
         if (signal.aborted) break
         console.error("Upload failed:", err)
+        logPipeline("error", "analyze_failed", {
+          runId,
+          index: i,
+          fileName: file.name,
+          error: errorMessage(err),
+        })
         setResults((prev) => {
           if (runIdRef.current !== runId || signal.aborted) return prev
           const next = [...prev]
@@ -337,10 +527,28 @@ export default function Home() {
           return next
         })
       }
+
+      const fileType = (file.type || "").toLowerCase()
+      const isPdf = fileType === "application/pdf" || /\.pdf$/i.test(file.name)
+      if (isPdf) {
+        previewTasks.push(startPreviewInBackground(file, i))
+      }
     }
-    if (runIdRef.current !== runId || signal.aborted) return
+    if (runIdRef.current !== runId || signal.aborted) {
+      logPipeline("warn", "processing_interrupted", {
+        runId,
+        aborted: signal.aborted,
+      })
+      return
+    }
     abortControllerRef.current = null
     setLoading(false)
+    await Promise.allSettled(previewTasks)
+    logPipeline("info", "processing_complete", {
+      runId,
+      totalFiles: filesArray.length,
+      previewTasks: previewTasks.length,
+    })
 
     setTimeout(() => {
       const resultsSection = document.getElementById("results-section")
@@ -355,6 +563,13 @@ export default function Home() {
         Math.max(1, results.length + 1)
       )
     : Math.max(uploadedFileNames.length, results.length, previewUrlsByFile.length)
+
+  const handleUploadSafe = (files: FileList) => {
+    void handleUpload(files).catch((err) => {
+      logPipeline("error", "upload_unhandled", { error: errorMessage(err) })
+      setLoading(false)
+    })
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-100 to-blue-50 flex flex-col items-center justify-center px-4 py-10">
@@ -401,7 +616,7 @@ export default function Home() {
       disabled={loading}
       onChange={(e) => {
         if (e.target.files && e.target.files.length > 0) {
-          handleUpload(e.target.files)
+          handleUploadSafe(e.target.files)
         }
       }}
       accept=".pdf,.jpg,.jpeg,.png,.tif,.tiff,.zip"
@@ -446,6 +661,7 @@ export default function Home() {
               result?.pages && result.pages.length > 0
                 ? new Array(result.pages.length).fill("image/png")
                 : previewMediaTypesByFile[idx] || []
+            const previewLoading = previewLoadingByFile[idx]
             const summary = result
               ? getSummaryBreakdown(result)
               : { perfect: [], partial: [], failed: [] as Array<{ name: string; reason: string }> }
@@ -483,7 +699,7 @@ export default function Home() {
                         selectedField={selectedField}
                         caption="Document Preview"
                       />
-                    ) : loading ? (
+                    ) : previewLoading ? (
                         <div className="text-amber-700 text-sm">
                           Generating preview...
                         </div>
